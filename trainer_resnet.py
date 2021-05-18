@@ -15,23 +15,17 @@ import json
 import os
 import networks
 import datasets
-from torchvision import transforms
 from train_utils import *
 from eval import EvalMetrics
 
 from PIL import Image
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
 import torchvision
 from torchvision import models, transforms
 import matplotlib.pyplot as plt
 import time
 import os
 import copy
-from networks.aan_net import AAN_Loss
 
 from torchvision.utils import save_image
 
@@ -39,6 +33,7 @@ from torch.autograd import Variable
 
 from networks import DeepLab_ResNet101_MSC
 from networks.ran_net import RAN
+
 
 def pil_loader(path):
     # open path as file to avoid ResourceWarning
@@ -104,7 +99,7 @@ class Trainer:
         self.parameters_to_train = []
 
         self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
-
+   
         # self.models["encoder"] = networks.ResnetEncoder(
         #     self.opt.num_layers, pretrained=False)
         # self.models["encoder"].to(self.device)
@@ -122,6 +117,7 @@ class Trainer:
 
         model_101, input_size = self.initialize_model("resnet101", num_classes, feature_extract, use_pretrained=True)
         self.models["resnet101"] = model_101
+        print(self.models["resnet101"])
         self.models["resnet101"].to(self.device)
 
         # self.models["RAN"] = DeepLab_ResNet101_MSC(n_classes=21)
@@ -129,13 +125,18 @@ class Trainer:
         self.models["RAN"].to(self.device)
 
         self.models["unet"] = networks.UNet(n_channels=1, n_classes=4)
-        self.models["unet"].to(self.device)
+        self.parameters_to_train += list(self.models["unet"].parameters())
 
+        self.model_optimizer = optim.Adam(self.parameters_to_train,
+                                          self.opt.learning_rate)
+        self.load_model()
+        print(self.models["unet"])
+        self.models["unet"].to(self.device)
+        sys.exit()
         # self.parameters_to_train += list(self.models["unet"].parameters())
         # self.parameters_to_train += list(self.models["resnet50"].parameters())
         # self.parameters_to_train += list(self.models["resnet101"].parameters())
 
-        self.parameters_to_train = nn.Parameter(rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device="cuda")), requires_grad=True)
 
         '''
         w = Variable(torch.randn(3, 5), requires_grad=True)
@@ -144,8 +145,7 @@ class Trainer:
         self.parameters_to_train += b
         '''
 
-        self.model_optimizer = optim.Adam([self.parameters_to_train],
-                                          self.opt.learning_rate)
+
 
         '''
         self.model_optimizer = optim.Adam(self.parameters_to_train,
@@ -635,7 +635,7 @@ class Trainer:
             print("Loading {} weights...".format(n))
             path = os.path.join(self.opt.load_weights_folder, "{}.pth".format(n))
             model_dict = self.models[n].state_dict()
-            pretrained_dict = torch.load(path)
+            pretrained_dict = torch.load(path, map_location=self.device)
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
             model_dict.update(pretrained_dict)
             self.models[n].load_state_dict(model_dict)
@@ -644,7 +644,7 @@ class Trainer:
         optimizer_load_path = os.path.join(self.opt.load_weights_folder, "adam.pth")
         if os.path.isfile(optimizer_load_path):
             print("Loading Adam weights")
-            optimizer_dict = torch.load(optimizer_load_path)
+            optimizer_dict = torch.load(optimizer_load_path, map_location=self.device)
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
