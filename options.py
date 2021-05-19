@@ -17,6 +17,11 @@ class Options:
                                  help="path to the training data",
                                  default=os.path.join(file_dir, "Retouch-dataset/pre_processed"))
 
+        self.parser.add_argument("--vendor_dir",
+                                 type=str,
+                                 help="path to the vendor",
+                                 default=os.path.join(file_dir, "Retouch-dataset"))
+        
         self.parser.add_argument("--list_dir",
                                  type=str,
                                  help="path to the split",

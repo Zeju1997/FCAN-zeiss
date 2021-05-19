@@ -23,8 +23,6 @@ from PIL import Image
 import torchvision
 from torchvision import models, transforms
 import matplotlib.pyplot as plt
-import time
-import os
 import copy
 
 from torchvision.utils import save_image
@@ -33,6 +31,7 @@ from torch.autograd import Variable
 
 from networks import DeepLab_ResNet101_MSC
 from networks.ran_net import RAN
+from networks.unet_layer import UNet_Layer
 
 
 def pil_loader(path):
@@ -42,7 +41,6 @@ def pil_loader(path):
         with Image.open(f) as img:
             return img.convert('L')
 
-from networks.pyramid_pooling import SpatialPyramidPooling
 
 print("PyTorch Version: ", torch.__version__)
 print("Torchvision Version: ", torchvision.__version__)
@@ -117,11 +115,10 @@ class Trainer:
 
         model_101, input_size = self.initialize_model("resnet101", num_classes, feature_extract, use_pretrained=True)
         self.models["resnet101"] = model_101
-        print(self.models["resnet101"])
         self.models["resnet101"].to(self.device)
 
         # self.models["RAN"] = DeepLab_ResNet101_MSC(n_classes=21)
-        self.models["RAN"] = RAN(in_channels=2048, out_channels=21)
+        self.models["RAN"] = RAN(in_channels=512, out_channels=21)
         self.models["RAN"].to(self.device)
 
         self.models["unet"] = networks.UNet(n_channels=1, n_classes=4)
@@ -130,9 +127,9 @@ class Trainer:
         self.model_optimizer = optim.Adam(self.parameters_to_train,
                                           self.opt.learning_rate)
         self.load_model()
-        print(self.models["unet"])
         self.models["unet"].to(self.device)
-        sys.exit()
+        self.models["unet_down4"] = UNet_Layer(output_layer='down4')
+        self.models["unet_down4"].to(self.device)
         # self.parameters_to_train += list(self.models["unet"].parameters())
         # self.parameters_to_train += list(self.models["resnet50"].parameters())
         # self.parameters_to_train += list(self.models["resnet101"].parameters())
@@ -294,7 +291,7 @@ class Trainer:
     '''
 
     def train(self):
-        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device="cuda"))
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
         input.requires_grad_(True)
 
         '''
@@ -317,12 +314,13 @@ class Trainer:
             for i in range(self.num_batch):
                 entity = next(dataloader_iterator)
                 if i == 0:
-                    target = grey_to_rgb(entity["image"].cuda())
+                    target = entity["image"].cuda()
                 else:
-                    target = torch.cat((target, grey_to_rgb(entity["image"].cuda())), dim=0)
+                    target = torch.cat((target, entity["image"].cuda()), dim=0)
             inputs = {}
-            inputs["source"] = grey_to_rgb(source["image"]).cuda()
+            inputs["source"] = source["image"].cuda()
             inputs["target"] = target
+            inputs["label"] = source["label"]
             L_RAN = self.compute_RAN_loss(inputs)
 
             sys.exit()
@@ -533,36 +531,29 @@ class Trainer:
     def compute_RAN_loss(self, inputs):
         print("compute RAN loss")
         features = {}
-        self.models["resnet101"].layer4[2].conv3.register_forward_hook(get_activation('res5c')) # [1, 2048, 16, 16]
-        output = self.models["resnet101"](inputs["source"])
-        features["source"] = self.models['RAN'](activation['res5c'])
-
         outputs = {}
-        pooling = SpatialPyramidPooling(levels=[1])
-        p = pooling(activation['res5c'])
-        L_seg = 0
 
-        preds = self.models["unet"](p)
-        print("preds shape", preds.shape)
+        preds = self.models["unet"](inputs["source"])
+        # print("preds shape", preds.shape)
         outputs["pred"] = preds
         outputs["pred_idx"] = torch.argmax(preds, dim=1, keepdim=True)
         target = inputs['label']
         L_seg = self.compute_losses(inputs, outputs)
-        print("L_seg", L_seg)
+        # print("L_seg", L_seg['loss'])
 
-        sys.exit()
+        feature_map = self.models["unet_down4"](inputs["source"])
+        features["source"] = self.models['RAN'](feature_map)
+        # print("features source", features["source"])
 
-        del activation['res5c']
-        output = self.models["resnet101"](inputs["target"])
-        features["target"] = self.models['RAN'](activation['res5c'])
-        #print("features target shape", features["target"].shape)
+        feature_map = self.models["unet_down4"](inputs["target"])
+        features["target"] = self.models['RAN'](feature_map)
+        # print("features target", features["target"])
 
-        #devide input into target domain or dource domain
         L_adv = - torch.mean(torch.log(features["target"])) - torch.mean(torch.log(1-features["source"]))
-        print("L_adv", L_adv)
-
-        loss = L_adv - 5*L_seg
-        # print("test shape", test.shape)
+        # print("L_adv", L_adv)
+        loss = torch.tensor(0, device=self.device)
+        loss = L_adv - 5*L_seg['loss']
+        print("L_RAN", loss)
 
         return loss
 
