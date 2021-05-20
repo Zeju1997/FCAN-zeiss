@@ -137,7 +137,7 @@ class Trainer:
         self.models["unet_encoder"].to(self.device)
 
         self.parameters_to_train_F += list(self.models["unet_encoder"].parameters())
-        self.parameters_to_train_D += list(self.models["unet"].parameters())
+        self.parameters_to_train_D += list(self.models["RAN"].parameters())
 
         self.optimizer_F = optim.Adam(self.parameters_to_train_F, self.opt.learning_rate)
         self.optimizer_D = optim.Adam(self.parameters_to_train_D, self.opt.learning_rate)
@@ -359,14 +359,19 @@ class Trainer:
         inputs["target"] = target_img
         L_RAN = self.compute_RAN_loss(inputs)
         '''
-        self.num_batch = 1
+        self.sample = 0
+        self.num_sample = 0
         self.num_epoch = 10
         self.num_iteration = 10
         loss = nn.BCELoss()
         for epoch in range(self.num_epoch):
-            # F(x_t) = x: true data
-            # F(x_s) = G(z): generated data
-            for source_cirrus, source_spectralis in zip(self.cirrus_loader, self.spectralis_loader):   # spectralis aan processed data!!!!!!!!!!!!!
+            '''
+                F(x_t) = x: true data / spectralis / target
+                F(x_s) = G(z): generated data / cirrus / source
+                models["RAN"]: discriminator
+                models["unet_encoder"]: feature generator / encoder
+            '''
+            for cirrus_sample, spectralis_sample in zip(self.cirrus_loader, self.spectralis_loader):   # spectralis aan processed data!!!!!!!!!!!!!
                 '''
                 dataloader_iterator = iter(self.cirrus_loader)
                 for i in range(self.num_batch):
@@ -385,46 +390,45 @@ class Trainer:
                 self.optimizer_F.zero_grad()
 
                 # generate feature encoding
-                feature_cirrus = self.models["unet_encoder"](source_cirrus["image"].cuda())
+                generated_data = self.models["unet_encoder"](cirrus_sample["image"].cuda()) # [1, 512, 32, 32]
+                true_data = self.models["unet_encoder"](spectralis_sample["image"].cuda()) # [1, 512, 32, 32]
+
+                true_labels = torch.ones_like(true_data) # [1, 512, 32, 32]
+                false_labels = torch.zeros_like(true_data) # [1, 512, 32, 32]
 
                 # Train the generator
                 # We invert the labels here and don't train the discriminator because we want the generator
                 # to make things the discriminator classifies as true
-                prediction_cirrus = self.models["RAN"](feature_cirrus)
-                true_labels_cirrus = torch.zeros_like(prediction_cirrus)
-
-                Z = prediction_cirrus[1] * prediction_cirrus[2] * prediction_cirrus[3]
-
-                generator_loss_cirrus = loss(prediction_spectralis, true_labels_cirrus)
-                generator_loss_cirrus.backward()
+                generator_discriminator_out = self.models["RAN"](generated_data) # [1, 512, 32, 32]
+                generator_loss = loss(generator_discriminator_out, true_labels)
+                generator_loss.backward()
                 self.optimizer_F.step()
 
-            # for source_cirrus, source_spectralis in zip(self.cirrus_loader, self.spectralis_loader):  # spectralis aan processed data!!!!!!!!!!!!!
+                # Z = prediction_cirrus[1] * prediction_cirrus[2] * prediction_cirrus[3]
+
                 # Train the discriminator on the true/generated data
                 self.optimizer_D.zero_grad()
-
-                # generate feature encoding
-                feature_spectralis = self.models["unet_encoder"](source_spectralis["image"].cuda())
-                feature_cirrus = self.models["unet_encoder"](source_cirrus["image"].cuda())
-                prediction_spectralis = self.models["RAN"](feature_spectralis)
-                true_labels_spectralis = torch.zeros_like(prediction_spectralis)
-                true_discriminator_loss = loss(true_discriminator_loss, true_labels_spectralis)
-
+                true_discriminator_loss = self.models["RAN"](true_data)
+                true_discriminator_loss = loss(true_discriminator_loss, true_labels)
 
                 # add .detach() here think about this
-                generator_discriminator_out = self.models["RAN"](feature_cirrus.detach())
-                generator_discriminator_loss = loss(generator_discriminator_out, torch.zeros(batch_size))
+                generator_discriminator_out = self.models["RAN"](generated_data.detach())
+                generator_discriminator_loss = loss(generator_discriminator_out, false_labels)
                 discriminator_loss = (true_discriminator_loss + generator_discriminator_loss) / 2
 
                 discriminator_loss.backward()
                 self.optimizer_D.step()
 
-            '''
-            print(
-                "[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f]"
-                % (epoch, opt.n_epochs, i, len(dataloader), d_loss.item(), g_loss.item())
-            )
+                self.sample += 1
 
+                print(
+                    "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
+                    % (epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
+                )
+            sys.exit()
+
+
+            '''
             batches_done = epoch * len(dataloader) + i
             if batches_done % opt.sample_interval == 0:
                 save_image(gen_imgs.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
