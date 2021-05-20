@@ -430,7 +430,6 @@ class Trainer:
             '''
         self.save_weight('unet_encoder')
         # print('unet_encoder weight', self.models["unet_encoder"].inc.double_conv[4].weight)
-        self.load_weight('unet')
         # print('unet weights', self.models["unet"].inc.double_conv[4].weight)
 
         sys.exit()
@@ -671,31 +670,22 @@ class Trainer:
             writer.add_image("predictions/{}".format(j), normalize_image(outputs["pred_idx"][j].data), self.step)
             writer.add_image("positive_region/{}".format(j), outputs["mask"][j].data, self.step)
 
-    def save_weight(self, model_name):
-        if model_name == 'unet_encoder':
-            print('save unet_encoder weights...')
-            for name, para in self.models["unet_encoder"].named_parameters():
-                self.encoder_weights[name] = para
-        elif model_name == 'unet':
-            print('save unet weights...')
-            model_dict = self.models["unet_encoder"].state_dict()
-            for name, para in self.models["unet"].named_parameters():
-                if name in model_dict:
-                    self.unet_weights[name] = para
+    def save_weight(self, model_save):
+        if model_save == 'unet_encoder':
+            print('save unet_encoder weights to unet...')
+            model_load = 'unet'
+        elif model_save == 'unet':
+            print('save unet weights to unet_encoder...')
+            model_load = 'unet_encoder'
+        else:
+            print('check model name.')
+        
+        model_dict = self.models[model_load].state_dict()
+        pretrained_dict = self.models[model_save].state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict)
+        self.models[model_load].load_state_dict(model_dict)
 
-
-    def load_weight(self, to_model):
-        if to_model == 'unet':
-            print('load unet_encoder weights to unet...')
-            model_dict = self.models['unet'].state_dict()
-            model_dict.update(self.encoder_weights)
-            self.models['unet'].load_state_dict(model_dict)
-        elif to_model == 'unet_encoder':
-            print('load unet weights to unet_encoder...')
-            model_dict = self.models["unet_encoder"].state_dict()
-            model_dict.update(self.unet_weights)
-            self.models['unet_encoder'].load_state_dict(model_dict)
-                
     def save_model(self):
         """Save model weights to disk
         """
