@@ -123,6 +123,7 @@ class Trainer:
         # self.models["RAN"] = DeepLab_ResNet101_MSC(n_classes=21)
         self.models["RAN"] = RAN(in_channels=512, out_channels=21)
         self.models["RAN"].to(self.device)
+        # print(self.models["unet"].inc.double_conv[4].weight)
 
         self.models["unet"] = networks.UNet(n_channels=1, n_classes=4)
         self.parameters_to_train += list(self.models["unet"].parameters())
@@ -343,9 +344,6 @@ class Trainer:
                 torch.cuda.empty_cache()
 
     def train_ran(self):
-        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
-        input.requires_grad_(True)
-
         '''
         source_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(CIRRUS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
         target_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(SPECTRALIS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
@@ -408,7 +406,7 @@ class Trainer:
 
                 # Train the discriminator on the true/generated data
                 self.optimizer_D.zero_grad()
-                true_discriminator_loss = self.models["RAN"](true_data)
+                true_discriminator_loss = self.models["RAN"](true_data.detach())
                 true_discriminator_loss = loss(true_discriminator_loss, true_labels)
 
                 # add .detach() here think about this
@@ -425,14 +423,18 @@ class Trainer:
                     "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
                     % (epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
                 )
-            sys.exit()
-
-
             '''
             batches_done = epoch * len(dataloader) + i
             if batches_done % opt.sample_interval == 0:
                 save_image(gen_imgs.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
             '''
+        self.save_weight('unet_encoder')
+        # print('unet_encoder weight', self.models["unet_encoder"].inc.double_conv[4].weight)
+        self.load_weight('unet')
+        # print('unet weights', self.models["unet"].inc.double_conv[4].weight)
+
+        sys.exit()
+
 
     def run_epoch(self, input, source, target):
         I = 500
@@ -669,6 +671,31 @@ class Trainer:
             writer.add_image("predictions/{}".format(j), normalize_image(outputs["pred_idx"][j].data), self.step)
             writer.add_image("positive_region/{}".format(j), outputs["mask"][j].data, self.step)
 
+    def save_weight(self, model_name):
+        if model_name == 'unet_encoder':
+            print('save unet_encoder weights...')
+            for name, para in self.models["unet_encoder"].named_parameters():
+                self.encoder_weights[name] = para
+        elif model_name == 'unet':
+            print('save unet weights...')
+            model_dict = self.models["unet_encoder"].state_dict()
+            for name, para in self.models["unet"].named_parameters():
+                if name in model_dict:
+                    self.unet_weights[name] = para
+
+
+    def load_weight(self, to_model):
+        if to_model == 'unet':
+            print('load unet_encoder weights to unet...')
+            model_dict = self.models['unet'].state_dict()
+            model_dict.update(self.encoder_weights)
+            self.models['unet'].load_state_dict(model_dict)
+        elif to_model == 'unet_encoder':
+            print('load unet weights to unet_encoder...')
+            model_dict = self.models["unet_encoder"].state_dict()
+            model_dict.update(self.unet_weights)
+            self.models['unet_encoder'].load_state_dict(model_dict)
+                
     def save_model(self):
         """Save model weights to disk
         """
