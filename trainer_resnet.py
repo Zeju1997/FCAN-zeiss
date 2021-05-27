@@ -33,6 +33,9 @@ from networks import DeepLab_ResNet101_MSC
 from networks.ran_net import RAN
 from networks.unet_layer import UNet_Layer
 from networks.unet_encoder import UNet_encoder
+from networks.aan_net import AAN
+
+from hyperparameter_tuning import random_search
 
 
 def pil_loader(path):
@@ -123,15 +126,14 @@ class Trainer:
         # self.models["RAN"] = DeepLab_ResNet101_MSC(n_classes=21)
         self.models["RAN"] = RAN(in_channels=512, out_channels=21)
         self.models["RAN"].to(self.device)
-        # print(self.models["unet"].inc.double_conv[4].weight)
 
         self.models["unet"] = networks.UNet(n_channels=1, n_classes=4)
+        self.models["unet"].to(self.device)
         self.parameters_to_train += list(self.models["unet"].parameters())
 
         # Optimizers
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
         self.load_model()
-        self.models["unet"].to(self.device)
 
         model_unet_encoder = self.initialize_model("unet_encoder", requires_grad=False)
         self.models["unet_encoder"] = model_unet_encoder
@@ -208,6 +210,21 @@ class Trainer:
             pin_memory=True,
             drop_last=True)
 
+        self.spectralis_aan_dataset_ = self.dataset(
+            base_dir=self.opt.aan_dir,
+            list_dir=self.opt.vendor_dir,
+            split='spectralis_samples',
+            is_train=True,
+            transform=self.transform)
+
+        self.spectralis_ann_loader = DataLoader(
+            self.spectralis_dataset,
+            1,
+            True,
+            num_workers=self.opt.num_workers,
+            pin_memory=True,
+            drop_last=True)
+
         train_dataset = self.dataset(
             base_dir=self.opt.base_dir,
             list_dir=self.opt.list_dir,
@@ -245,7 +262,7 @@ class Trainer:
         self.num_total_steps_AAN = len(self.cirrus_dataset) + len(self.spectralis_dataset)
 
         self.writers = {}
-        for mode in ["train", "val"]:
+        for mode in ["train", "val", "AAN"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
 
@@ -272,31 +289,9 @@ class Trainer:
             self.run_epoch()
             if (self.epoch + 1) % self.opt.save_frequency == 0 and self.opt.save_model:
                 self.save_model()
-                
-    
-    def run_epoch(self):
-        """Run a single epoch of training and validation
-        """
-        print("Training")
-        self.set_train()
-        for batch_idx, inputs in enumerate(self.train_loader):
-            before_op_time = time.time()
-            outputs, losses = self.process_batch(inputs)
-            self.model_optimizer.zero_grad()
-            losses["loss"].backward()
-            self.model_optimizer.step()
-            duration = time.time() - before_op_time
-            # log less frequently after the first 2000 steps to save time & disk space
-            # early_phase = batch_idx % self.opt.log_frequency == 0 #and self.step < 2000
-            # late_phase = self.step % 2000 == 0
-            if batch_idx % self.opt.log_frequency == 0:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
-                self.log("train", inputs, outputs, losses)
-                self.val()
-            self.step += 1
     '''
 
-    def train_aan(self):
+    def train_aan(self, alpha=1e-14, w_sem=[1, 1, 1, 1, 1], w_sty=[1, 1, 1, 1, 1]):
         input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
         input.requires_grad_(True)
 
@@ -313,7 +308,9 @@ class Trainer:
         inputs["target"] = target_img
         L_RAN = self.compute_RAN_loss(inputs)
         '''
-
+        self.alpha = alpha
+        self.w_sem = w_sem
+        self.w_sty = w_sty
         self.epoch = 0
         self.step = 0
         self.data = 0
@@ -335,15 +332,18 @@ class Trainer:
                 for i in range(self.num_batch):
                     entity = next(dataloader_iterator)
                     if i == 0:
-                        target = grey_to_rgb(entity["image"].cuda())
+                        target = grey_to_rgb(entity["image"].to(self.device))
                     else:
-                        target = torch.cat((target, grey_to_rgb(entity["image"].cuda())), dim=0)
-                img = self.run_epoch(input, grey_to_rgb(source["image"].cuda()), target)
+                        target = torch.cat((target, grey_to_rgb(entity["image"].to(self.device))), dim=0)
+                img = self.run_epoch_aan(input, grey_to_rgb(source["image"].to(self.device)), target)
                 save_image(img, out_path)
                 print("Image {}, in total {} samples".format(idx, self.num_sample))
                 torch.cuda.empty_cache()
 
     def train_ran(self):
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
+        input.requires_grad_(True)
+
         '''
         source_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(CIRRUS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
         target_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(SPECTRALIS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
@@ -361,105 +361,168 @@ class Trainer:
         self.num_sample = 0
         self.num_epoch = 10
         self.num_iteration = 10
-        loss = nn.BCELoss()
-        for epoch in range(self.num_epoch):
+        self.loss = nn.BCELoss()
+        for self.epoch in range(self.num_epoch):
+
+            # run adversarial branch
+            self.run_epoch_adv()
+
+            self.save_weight('unet_encoder')
+
+            # run segmentation branch
+            self.run_epoch_seg()
+
+            self.save_weight('unet')
+
+            sys.exit()
+
+            if (self.epoch + 1) % self.opt.save_frequency == 0 and self.opt.save_model:
+                self.save_model()
+
+            '''
+            
+            print(
+                "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
+                % (epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
+            )
+            
+            
+            batches_done = epoch * len(dataloader) + i
+            if batches_done % opt.sample_interval == 0:
+                save_image(gen_imgs.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
+            '''
+    def run_epoch_adv(self):
+        for cirrus_sample, spectralis_sample in zip(self.cirrus_loader, self.spectralis_loader):   # spectralis aan processed data!!!!!!!!!!!!!
             '''
                 F(x_t) = x: true data / spectralis / target
                 F(x_s) = G(z): generated data / cirrus / source
                 models["RAN"]: discriminator
                 models["unet_encoder"]: feature generator / encoder
             '''
-            for cirrus_sample, spectralis_sample in zip(self.cirrus_loader, self.spectralis_loader):   # spectralis aan processed data!!!!!!!!!!!!!
-                '''
-                dataloader_iterator = iter(self.cirrus_loader)
-                for i in range(self.num_batch):
-                    entity = next(dataloader_iterator)
-                    if i == 0:
-                        target = entity["image"].cuda()
-                    else:
-                        target = torch.cat((target, entity["image"].cuda()), dim=0)
-                inputs = {}
-                inputs["source"] = source["image"].cuda()
-                inputs["target"] = target
-                inputs["label"] = source["label"]
-                L_RAN = self.compute_RAN_loss(inputs)
-                '''
-                # zero the gradients of the feature extractor on each iteration
-                self.optimizer_F.zero_grad()
-
-                # generate feature encoding
-                generated_data = self.models["unet_encoder"](cirrus_sample["image"].cuda()) # [1, 512, 32, 32]
-                true_data = self.models["unet_encoder"](spectralis_sample["image"].cuda()) # [1, 512, 32, 32]
-
-                true_labels = torch.ones_like(true_data) # [1, 512, 32, 32]
-                false_labels = torch.zeros_like(true_data) # [1, 512, 32, 32]
-
-                # Train the generator
-                # We invert the labels here and don't train the discriminator because we want the generator
-                # to make things the discriminator classifies as true
-                generator_discriminator_out = self.models["RAN"](generated_data) # [1, 512, 32, 32]
-                generator_loss = loss(generator_discriminator_out, true_labels)
-                generator_loss.backward()
-                self.optimizer_F.step()
-
-                # Z = prediction_cirrus[1] * prediction_cirrus[2] * prediction_cirrus[3]
-
-                # Train the discriminator on the true/generated data
-                self.optimizer_D.zero_grad()
-                true_discriminator_loss = self.models["RAN"](true_data.detach())
-                true_discriminator_loss = loss(true_discriminator_loss, true_labels)
-
-                # add .detach() here think about this
-                generator_discriminator_out = self.models["RAN"](generated_data.detach())
-                generator_discriminator_loss = loss(generator_discriminator_out, false_labels)
-                discriminator_loss = (true_discriminator_loss + generator_discriminator_loss) / 2
-
-                discriminator_loss.backward()
-                self.optimizer_D.step()
-
-                self.sample += 1
-
-                print(
-                    "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
-                    % (epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
-                )
             '''
-            batches_done = epoch * len(dataloader) + i
-            if batches_done % opt.sample_interval == 0:
-                save_image(gen_imgs.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
+            dataloader_iterator = iter(self.cirrus_loader)
+            for i in range(self.num_batch):
+                entity = next(dataloader_iterator)
+                if i == 0:
+                    target = entity["image"].cuda()
+                else:
+                    target = torch.cat((target, entity["image"].cuda()), dim=0)
+            inputs = {}
+            inputs["source"] = source["image"].cuda()
+            inputs["target"] = target
+            inputs["label"] = source["label"]
+            L_RAN = self.compute_RAN_loss(inputs)
             '''
-        self.save_weight('unet_encoder')
-        # print('unet_encoder weight', self.models["unet_encoder"].inc.double_conv[4].weight)
-        # print('unet weights', self.models["unet"].inc.double_conv[4].weight)
+            # zero the gradients of the feature extractor on each iteration
+            self.optimizer_F.zero_grad()
 
-        sys.exit()
+            # generate feature encoding
+            generated_data = self.models["unet_encoder"](cirrus_sample["image"].cuda()) # [1, 512, 32, 32]
+            true_data = self.models["unet_encoder"](spectralis_sample["image"].cuda()) # [1, 512, 32, 32]
 
+            true_labels = torch.ones_like(true_data) # [1, 512, 32, 32]
+            false_labels = torch.zeros_like(true_data) # [1, 512, 32, 32]
 
-    def run_epoch(self, input, source, target):
+            # Train the generator
+            # We invert the labels here and don't train the discriminator because we want the generator
+            # to make things the discriminator classifies as true
+            generator_discriminator_out = self.models["RAN"](generated_data) # [1, 512, 32, 32]
+            generator_loss = self.loss(generator_discriminator_out, true_labels)
+            generator_loss.backward()
+            self.optimizer_F.step()
+
+            # Z = prediction_cirrus[1] * prediction_cirrus[2] * prediction_cirrus[3]
+
+            # Train the discriminator on the true/generated data
+            self.optimizer_D.zero_grad()
+            true_discriminator_loss = self.models["RAN"](true_data)
+            true_discriminator_loss = self.loss(true_discriminator_loss, true_labels)
+
+            # add .detach() here think about this
+            generator_discriminator_out = self.models["RAN"](generated_data.detach())
+            generator_discriminator_loss = self.loss(generator_discriminator_out, false_labels)
+            discriminator_loss = (true_discriminator_loss + generator_discriminator_loss) / 2
+
+            discriminator_loss.backward()
+            self.optimizer_D.step()
+
+            self.sample += 1
+
+            print(
+                "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
+                % (self.epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
+            )
+
+    def run_epoch_seg(self):
+        """Run a single epoch of training and validation
+        """
+        print("Training")
+        self.set_train()
+        for batch_idx, inputs in enumerate(self.train_loader):
+            print("input", inputs)
+            before_op_time = time.time()
+            outputs, losses = self.process_batch(inputs)
+            self.model_optimizer.zero_grad()
+            losses["loss"].backward()
+            self.model_optimizer.step()
+            duration = time.time() - before_op_time
+
+            # log less frequently after the first 2000 steps to save time & disk space
+            # early_phase = batch_idx % self.opt.log_frequency == 0 #and self.step < 2000
+            # late_phase = self.step % 2000 == 0
+            '''
+            if batch_idx % self.opt.log_frequency == 0:
+                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
+                self.log("train", inputs, outputs, losses)
+                self.val()
+            '''
+
+            print(
+                "[Epoch %d/%d] [Sample %d/%d] [D loss: %f]"
+                % (self.epoch, self.num_epoch, batch_idx, len(self.train_loader), losses["loss"].item())
+            )
+
+    def run_epoch(self):
+        """Run a single epoch of training and validation
+        """
+        print("Training")
+        self.set_train()
+        for batch_idx, inputs in enumerate(self.train_loader):
+            before_op_time = time.time()
+            outputs, losses = self.process_batch(inputs)
+            self.model_optimizer.zero_grad()
+            losses["loss"].backward()
+            self.model_optimizer.step()
+            duration = time.time() - before_op_time
+            # log less frequently after the first 2000 steps to save time & disk space
+            # early_phase = batch_idx % self.opt.log_frequency == 0 #and self.step < 2000
+            # late_phase = self.step % 2000 == 0
+            if batch_idx % self.opt.log_frequency == 0:
+                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
+                self.log("train", inputs, outputs, losses)
+                self.val()
+            self.step += 1
+
+    def run_epoch_aan(self, input, source, target):
         I = 500
+        L_ANN = AAN()
         for self.step in range(I):
             before_op_time = time.time()
-            '''
-            L_ANN = AAN_Loss()
-            loss = L_ANN(input, source_img, target_img)
-            loss.backward()
-            # loss = torch.autograd.Variable(L_ANN.forward(), requires_grad=True)
-            print("loss", loss)
-            # grad = torch.autograd.grad(loss, input, allow_unused=True)
-            print("grad", input.grad)
-            '''
 
             if input.grad is not None:
                 print("zero gradient")
                 input.grad.zero_()
 
-            w = 20000 * (I - self.step) / I
-            L_ANN = self.compute_AAN_loss(input, source, target)
-            L_ANN.backward()
             # print("input", input)
-            # print("L_ANN", L_ANN)
-            # print("input max", input.max())
-            # print("input grad max", input.grad.max())
+            loss = L_ANN(input, source, target)
+            loss.backward()
+
+            # loss = torch.autograd.Variable(L_ANN.forward(), requires_grad=True)
+            # grad = torch.autograd.grad(loss, input, allow_unused=True)
+
+            w = 20000 * (I - self.step) / I
+            # loss = self.compute_AAN_loss(input, source, target)
+            # loss.backward()
 
             input = input.detach() - w * input.grad / torch.linalg.norm(input.grad.view(-1), ord=1)
             input.requires_grad_(True)
@@ -468,21 +531,27 @@ class Trainer:
             # self.model_optimizer.step()
 
             duration = time.time() - before_op_time
-            print("step", self.step, "loss", L_ANN, "duration", duration)
+            print("step", self.step, "loss", loss, "duration", duration)
 
-            # log less frequently after the first 2000 steps to save time & disk space
-            # early_phase = batch_idx % self.opt.log_frequency == 0 #and self.step < 2000
-            # late_phase = self.step % 2000 == 0
-
-            '''
-            if batch_idx % self.opt.log_frequency == 0:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
-                print("train", inputs, outputs, losses)
-                self.val()
-            '''
             self.step += 1
         img = input.squeeze(0)
         return img
+
+    def save_weight(self, model_save):
+        if model_save == 'unet_encoder':
+            print('save unet_encoder weights to unet...')
+            model_load = 'unet'
+        elif model_save == 'unet':
+            print('save unet weights to unet_encoder...')
+            model_load = 'unet_encoder'
+        else:
+            print('check model name.')
+
+        model_dict = self.models[model_load].state_dict()
+        pretrained_dict = self.models[model_save].state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict)
+        self.models[model_load].load_state_dict(model_dict)
 
     def process_batch(self, inputs):
         for key, ipt in inputs.items():
@@ -670,22 +739,6 @@ class Trainer:
             writer.add_image("predictions/{}".format(j), normalize_image(outputs["pred_idx"][j].data), self.step)
             writer.add_image("positive_region/{}".format(j), outputs["mask"][j].data, self.step)
 
-    def save_weight(self, model_save):
-        if model_save == 'unet_encoder':
-            print('save unet_encoder weights to unet...')
-            model_load = 'unet'
-        elif model_save == 'unet':
-            print('save unet weights to unet_encoder...')
-            model_load = 'unet_encoder'
-        else:
-            print('check model name.')
-        
-        model_dict = self.models[model_load].state_dict()
-        pretrained_dict = self.models[model_save].state_dict()
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(pretrained_dict)
-        self.models[model_load].load_state_dict(model_dict)
-
     def save_model(self):
         """Save model weights to disk
         """
@@ -814,6 +867,51 @@ class Trainer:
             exit()
 
         return model_ft
+
+
+
+    def evaluate(self):
+        self.dice_loss = 0
+        self.iou_loss = 0
+        self.vendor = "Spectralis"
+        for idx, source in enumerate(self.spectralis_loader):
+            outputs, losses = self.process_batch(source)
+            self.compute_accuracy(source, outputs, losses)
+            self.dice_loss += losses["accuracy/dice"] / len(self.cirrus_loader)
+            self.iou_loss += losses["accuracy/iou"] / len(self.cirrus_loader)
+        print("Evaluating {} data set, in total {} samples ...".format(self.vendor, len(self.spectralis_loader)))
+        print("[Evaluation result] accuracy/dice: {}, accuracy/iou: {}".format(self.dice_loss, self.iou_loss))
+        print("Evaluation finished!")
+
+
+    def hyperparameter_tuning(self):
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
+        input.requires_grad_(True)
+
+        results = random_search(input, self.cirrus_loader, self.spectralis_loader,
+                                                          random_search_spaces = {
+                                                            # "lr": ([1e-3, 1e-4], 'log'),
+                                                            # "lr_decay": ([0.8, 0.9], 'float'),
+                                                            # "reg": ([1e-3, 1e-5], "log"), # [1e-4, 1e-6]
+                                                            # "std": ([1e-2, 1e-5], "log"), # [1e-4, 1e-6]
+                                                            # "hidden_size": ([150, 250], "int"),
+                                                            # "num_layer": ([2, 4], "int"), # [2, 5]
+                                                            "w_os_conv1": ([1e-1, 1], 'float'),
+                                                            "w_os_res2c": ([1e-1, 1], 'float'),
+                                                            "w_os_res3d": ([1e-1, 1], 'float'),
+                                                            "w_os_res4f": ([1e-1, 1], 'float'),
+                                                            "w_os_res5c": ([1e-1, 1], 'float'),
+                                                            "w_ot_conv1": ([1e-1, 1], 'float'),
+                                                            "w_ot_res2c": ([1e-1, 1], 'float'),
+                                                            "w_ot_res3d": ([1e-1, 1], 'float'),
+                                                            "w_ot_res4f": ([1e-1, 1], 'float'),
+                                                            "w_ot_res5c": ([1e-1, 1], 'float'),
+                                                            "alpha": ([1e-2, 1e-6], 'log'),
+                                                           },
+                                                            hyper_param = {
+                                                            "lr_init": ([5000, 50000], 'float')
+                                                           }, num_search=20, num_samples=4, epochs=1, patience=20, writer=self.writers["AAN"])
+        # print("results", results)
 
 
 def train_model(model, dataloaders, criterion, optimizer, num_epochs=25, is_inception=False):
