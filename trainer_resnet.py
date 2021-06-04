@@ -885,7 +885,7 @@ class Trainer:
 
 
     def hyperparameter_tuning(self):
-        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 1, 512, 512), device=self.device))
         input.requires_grad_(True)
 
         results = random_search(input, self.cirrus_loader, self.spectralis_loader,
@@ -896,20 +896,20 @@ class Trainer:
                                                             # "std": ([1e-2, 1e-5], "log"), # [1e-4, 1e-6]
                                                             # "hidden_size": ([150, 250], "int"),
                                                             # "num_layer": ([2, 4], "int"), # [2, 5]
-                                                            "w_os_conv1": ([1e-1, 1], 'float'),
-                                                            "w_os_res2c": ([1e-1, 1], 'float'),
-                                                            "w_os_res3d": ([1e-1, 1], 'float'),
-                                                            "w_os_res4f": ([1e-1, 1], 'float'),
-                                                            "w_os_res5c": ([1e-1, 1], 'float'),
-                                                            "w_ot_conv1": ([1e-1, 1], 'float'),
-                                                            "w_ot_res2c": ([1e-1, 1], 'float'),
-                                                            "w_ot_res3d": ([1e-1, 1], 'float'),
-                                                            "w_ot_res4f": ([1e-1, 1], 'float'),
-                                                            "w_ot_res5c": ([1e-1, 1], 'float'),
-                                                            "alpha": ([1e-2, 1e-6], 'log'),
+                                                            "w_os_conv1": ([8, 10], 'float'),
+                                                            "w_os_res2c": ([6, 8], 'float'),
+                                                            "w_os_res3d": ([4, 6], 'float'),
+                                                            "w_os_res4f": ([2, 4], 'float'),
+                                                            "w_os_res5c": ([1, 3], 'float'),
+                                                            "w_ot_conv1": ([8, 10], 'float'),
+                                                            "w_ot_res2c": ([6, 8], 'float'),
+                                                            "w_ot_res3d": ([4, 6], 'float'),
+                                                            "w_ot_res4f": ([2, 4], 'float'),
+                                                            "w_ot_res5c": ([1, 3], 'float'),
+                                                            "alpha": ([5e-3, 5e-3], 'log'),
                                                            },
                                                             hyper_param = {
-                                                            "lr_init": ([5000, 50000], 'float')
+                                                            "lr_init": ([5000, 15000], 'float')
                                                            }, num_search=20, num_samples=4, epochs=1, patience=20, writer=self.writers["AAN"])
         # print("results", results)
 

@@ -87,15 +87,18 @@ def findBestConfig(input, cirrus_loader, spectralis_loader, configs, hyper, EPOC
     spectralis_iterator = iter(spectralis_loader)
     cirrus_iterator = iter(cirrus_loader)
     source_dict = next(spectralis_iterator)
-    source = grey_to_rgb(source_dict["image"].to(device))
+    # source = grey_to_rgb(source_dict["image"].to(device))
+    source = source_dict["image"].to(device)
     log_img(writer, "input_image", torch.cat((source, input), dim=0))
     num_batch = 5
     for i in range(num_batch):
         entity = next(cirrus_iterator)
         if i == 0:
-            target = grey_to_rgb(entity["image"].to(device))
+            # target = grey_to_rgb(entity["image"].to(device))
+            target = entity["image"].to(device)
         else:
-            target = torch.cat((target, grey_to_rgb(entity["image"].to(device))), dim=0)
+            # target = torch.cat((target, grey_to_rgb(entity["image"].to(device))), dim=0)
+            target = torch.cat((target, entity["image"].to(device)), dim=0)
 
     for i in range(len(configs)):
         print("\nEvaluating Config #{} [of {}]:\n".format((i+1), len(configs)), configs[i], hyper[i])
@@ -103,6 +106,7 @@ def findBestConfig(input, cirrus_loader, spectralis_loader, configs, hyper, EPOC
         # solver = Solver(model, train_loader, val_loader, **configs[i])
         # solver.train(epochs=EPOCHS, patience=PATIENCE)
         I = 2000
+        iter_no_improve = 0
         input_i = input
         min_loss = 10000
         lr_init = hyper[i]["lr_init"]

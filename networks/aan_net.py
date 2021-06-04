@@ -3,11 +3,33 @@ import sys
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
-from torchvision import models
-from .aan_parts import *
-
+import torchvision.models as models
 
 activation = {}
+
+class ResNetMultiImageInput(models.ResNet):
+    """Constructs a resnet model with varying number of input images.
+    Adapted from https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
+    """
+    def __init__(self, block, layers, num_classes=4):
+        super(ResNetMultiImageInput, self).__init__(block, layers)
+        self.inplanes = 64
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        self.__class__ = models.resnet.ResNet
 
 class AAN(torch.nn.Module):
 
@@ -142,9 +164,13 @@ class AAN(torch.nn.Module):
             """ Resnet50
             """
             print("Loading resnet50...")
-            # model_ft = models.resnet50(pretrained=use_pretrained)
-            model_ft = models.resnet50()
-            model_ft.load_state_dict(torch.load('model/pretrained/resnet50.pth'))
+
+            # model_ft = models.resnet50()
+            model_ft =  ResNetMultiImageInput(models.resnet.Bottleneck, [3, 4, 6, 3])
+            loaded = torch.load('model/pretrained/resnet50.pth')
+            loaded['conv1.weight'] = torch.mean(loaded['conv1.weight'], dim=1).view(64, 1, 7, 7)
+            model_ft.load_state_dict(loaded)
+            # model_ft.load_state_dict(torch.load('model/pretrained/resnet50.pth'))
             self.set_parameter_requires_grad(model_ft, requires_grad)
             # num_ftrs = model_ft.fc.in_features
             # model_ft.fc = nn.Linear(num_ftrs, num_classes)
