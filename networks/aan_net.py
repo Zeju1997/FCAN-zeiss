@@ -3,33 +3,9 @@ import sys
 import torch.nn.functional as F
 import torch
 import torch.nn as nn
-import torchvision.models as models
+from torchvision import models
 
 activation = {}
-
-class ResNetMultiImageInput(models.ResNet):
-    """Constructs a resnet model with varying number of input images.
-    Adapted from https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
-    """
-    def __init__(self, block, layers, num_classes=4):
-        super(ResNetMultiImageInput, self).__init__(block, layers)
-        self.inplanes = 64
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-        self.__class__ = models.resnet.ResNet
 
 class AAN(torch.nn.Module):
 
@@ -78,6 +54,9 @@ class AAN(torch.nn.Module):
         G_t = []
         L = ['conv1', 'res2c', 'res3d', 'res4f', 'res5c']
 
+        input = self.normalize_img(input)
+        source = self.normalize_img(source)
+
         input.requires_grad_(True)
 
         # model_ft.layer1[0].conv2.register_forward_hook(hook_fn)
@@ -90,7 +69,8 @@ class AAN(torch.nn.Module):
 
         for layer in L:
             M_o.append(activation[layer])
-            G_o.append(self.generate_style_image(activation[layer]))
+            # G_o.append(self.generate_style_image(activation[layer]))
+            G_o.append(activation[layer])
             del activation[layer]
 
         self.models["resnet50"].conv1.register_forward_hook(self.get_activation('conv1')) # conv1
@@ -98,7 +78,7 @@ class AAN(torch.nn.Module):
         self.models["resnet50"].layer2[3].conv3.register_forward_hook(self.get_activation('res3d')) # res3d
         self.models["resnet50"].layer3[5].conv3.register_forward_hook(self.get_activation('res4f')) # res4f
         self.models["resnet50"].layer4[2].conv3.register_forward_hook(self.get_activation('res5c')) # res5c
-        output = self.models["resnet50"](source)
+        output_source = self.models["resnet50"](source)
 
         for layer in L:
             M_s.append(activation[layer])
@@ -111,20 +91,53 @@ class AAN(torch.nn.Module):
             self.models["resnet50"].layer2[3].conv3.register_forward_hook(self.get_activation('res3d')) # res3d
             self.models["resnet50"].layer3[5].conv3.register_forward_hook(self.get_activation('res4f')) # res4f
             self.models["resnet50"].layer4[2].conv3.register_forward_hook(self.get_activation('res5c')) # res5c
-            output = self.models["resnet50"](target[i, :, :, :].unsqueeze(0))
+            output_target = self.models["resnet50"](self.normalize_img(target[i, :, :, :].unsqueeze(0)))
+            # output_target = self.models["resnet50"](target[i, :, :, :].unsqueeze(0))
             for idx, layer in enumerate(L):
                 if len(G_t) < 5:
-                    G_t.append(self.generate_style_image(activation[layer]) / target.shape[0])
+                    # G_t.append(self.generate_style_image(activation[layer]) / target.shape[0])
+                    G_t.append(activation[layer] / target.shape[0])
                 else:
-                    G_t[idx] += self.generate_style_image(activation[layer]) / target.shape[0]
+                    # G_t[idx] += self.generate_style_image(activation[layer]) / target.shape[0]
+                    G_t[idx] += activation[layer] / target.shape[0]
                 del activation[layer]
 
         loss = torch.tensor(0, device=self.device)
+        loss_seman = torch.tensor(0, device=self.device)
+        loss_style = torch.tensor(0, device=self.device)
+        loss_grey = torch.tensor(0, device=self.device)
+        input_mean = torch.mean(input, 1)
         for i in range(len(M_o)):
             layer = L[i]
-            loss = loss + self.w_os[layer] * torch.dist(M_o[i], M_s[i], 2) + self.alpha * self.w_ot[layer] * torch.dist(G_o[i], G_t[i], 2)
+            loss = loss + self.w_os[layer] * self.content_loss(M_o[i], M_s[i]) + self.alpha * self.w_ot[layer] * self.style_loss(G_o[i], G_t[i])
+            loss_seman = loss_seman + self.w_os[layer] * self.content_loss(M_o[i], M_s[i])
+            loss_style = loss_style + self.alpha * self.w_ot[layer] * self.style_loss(G_o[i], G_t[i])
+            # loss = loss + self.w_os[layer] * torch.dist(M_o[i], M_s[i], 2) + self.alpha * self.w_ot[layer] * torch.dist(G_o[i], G_t[i], 2) # + torch.mean(std_input) * 256
+            # loss_seman = loss_seman + self.w_os[layer] * torch.dist(M_o[i], M_s[i], 2)
+            # loss_style = loss_style + self.alpha * self.w_ot[layer] * torch.dist(G_o[i], G_t[i], 2)
+        # loss = loss + torch.mean(torch.abs(input[:, 0, :, :] - input_mean) * 256) + torch.mean(torch.abs(input[:, 1, :, :] - input_mean) * 256) + torch.mean(torch.abs(input[:, 2, :, :] - input_mean) * 256)
+        # loss_grey = torch.mean(torch.abs(input[:, 0, :, :] - input_mean) * 256) + torch.mean(torch.abs(input[:, 1, :, :] - input_mean) * 256) + torch.mean(torch.abs(input[:, 2, :, :] - input_mean) * 256)
+        return loss, loss_seman, loss_style, loss_grey
 
-        # test_loss = Variable(loss, requires_grad=True)
+    def normalize_img(self, img):
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1).to(self.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1).to(self.device)
+        return (img - mean) / std
+
+    def style_loss(self, input, target):
+        input_gram = self.gram_matrix(input)
+        target_gram = self.gram_matrix(target)
+        loss = F.mse_loss(input_gram, target_gram)
+        return loss
+
+    def gram_matrix(self, input):
+        a, b, c, d = input.size()
+        features = input.view(a * b, c * d)
+        G = torch.mm(features, features.t())
+        return G.div(a * b * c * d)
+
+    def content_loss(self, input, target):
+        loss = F.mse_loss(input, target)
         return loss
 
     def get_activation(self, name):
@@ -164,13 +177,9 @@ class AAN(torch.nn.Module):
             """ Resnet50
             """
             print("Loading resnet50...")
-
-            # model_ft = models.resnet50()
-            model_ft =  ResNetMultiImageInput(models.resnet.Bottleneck, [3, 4, 6, 3])
-            loaded = torch.load('model/pretrained/resnet50.pth')
-            loaded['conv1.weight'] = torch.mean(loaded['conv1.weight'], dim=1).view(64, 1, 7, 7)
-            model_ft.load_state_dict(loaded)
-            # model_ft.load_state_dict(torch.load('model/pretrained/resnet50.pth'))
+            # model_ft = models.resnet50(pretrained=use_pretrained)
+            model_ft = models.resnet50()
+            model_ft.load_state_dict(torch.load('model/pretrained/resnet50.pth'))
             self.set_parameter_requires_grad(model_ft, requires_grad)
             # num_ftrs = model_ft.fc.in_features
             # model_ft.fc = nn.Linear(num_ftrs, num_classes)
