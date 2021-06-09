@@ -22,18 +22,17 @@ class AAN(torch.nn.Module):
         self.w_ot = {}
 
         if configs is None:
-            print("right config")
-            self.alpha = 3.4400135531611185e-05
-            self.w_os["conv1"] = 0.12467511325675217
-            self.w_os["res2c"] = 0.841792665975288
-            self.w_os["res3d"] = 0.7283800534768836
-            self.w_os["res4f"] = 0.24933916606795983
-            self.w_os["res5c"] = 0.4320931831878144
-            self.w_ot["conv1"] = 0.5169743140475447
-            self.w_ot["res2c"] = 0.6733070050121481
-            self.w_ot["res3d"] = 0.21573017541852707
-            self.w_ot["res4f"] = 0.9378209392508551
-            self.w_ot["res5c"] = 0.6055805286243681
+            self.alpha = 2361759.1383429
+            self.w_os["conv1"] = 1.4833282507245544
+            self.w_os["res2c"] = 3.910816904760316
+            self.w_os["res3d"] = 5.0634122235909444
+            self.w_os["res4f"] = 7.435837022192873
+            self.w_os["res5c"] = 7.2119672293035615
+            self.w_ot["conv1"] = 1.515706416672807
+            self.w_ot["res2c"] = 4.556745920981047
+            self.w_ot["res3d"] = 7.846647656393519
+            self.w_ot["res4f"] = 8.991458503687417
+            self.w_ot["res5c"] = 19.40233534738993
         else:
             self.alpha = configs["alpha"]
             self.w_os["conv1"] = configs["w_os_conv1"]
