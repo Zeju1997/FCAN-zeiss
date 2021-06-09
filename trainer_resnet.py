@@ -38,6 +38,7 @@ from networks.aan_net import AAN
 from hyperparameter_tuning import random_search
 
 import shutil
+import math
 
 
 def pil_loader(path):
@@ -195,7 +196,7 @@ class Trainer:
         #                                      ignore_index=self.opt.ignore_idx)
         self.criterion = nn.CrossEntropyLoss(reduction='none')
 
-        self.source_dataset_AAN, self.source_dir_AAN = self.initialize_dataset_AAN("cirrus")
+        self.source_dataset_AAN, self.source_dir_AAN = self.initialize_dataset_AAN("cirrus_val")
         self.target_dataset_AAN, self.target_dir_AAN = self.initialize_dataset_AAN("spectralis")
 
         self.source_dataloader_AAN = DataLoader(
@@ -335,13 +336,16 @@ class Trainer:
         input = rescale_transform(torch.normal(mean=0.5, std=1, size=sample["image"].shape, device=self.device))
         input.requires_grad_(True)
 
-        '''
-        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(3, 512, 512)))
-        input = input.unsqueeze(0)
-        net = torchvision.models.resnet50(pretrained=False)
-        net.layer1[1].bn1.register_forward_hook(self.printbn)
-        net.forward(input)
-        '''
+        source_iterator = iter(self.source_dataloader_AAN)
+        source_dict = next(source_iterator)
+
+        # source = grey_to_rgb(source_dict["image"].to(device))
+        source = source_dict["image"].to(self.device)
+
+        # input = rescale_transform(torch.normal(mean=0.5, std=1, size=source.shape, device=device))
+        # input = torch.randn(source.data.size(), device=device)
+        input = source
+        input.requires_grad_(True)
 
         self.epoch = 0
         self.step = 0
@@ -350,6 +354,7 @@ class Trainer:
         self.num_batch = 5
         self.num_sample = len(self.source_dataloader_AAN)
         print("In total {} samples found.".format(self.num_sample))
+
         for idx, source in enumerate(self.source_dataloader_AAN):
             vendor = source["case_name"][0].split(' ')[0]
             slice_name = source["case_name"][0].split(' ')[1]
@@ -358,17 +363,38 @@ class Trainer:
             out_path = os.path.join(out_dir, "{}.jpg".format(slice_idx))
             if not os.path.exists(out_dir):
                 os.makedirs(out_dir)
-            if os.path.exists(out_dir):
+            if not os.path.exists(out_path):
                 for i in range(self.num_batch):
                     entity = next(target_dataloader_iterator)
                     if i == 0:
-                        target = grey_to_rgb(entity["image"].to(self.device))
+                        target = entity["image"].to(self.device)
                     else:
-                        target = torch.cat((target, grey_to_rgb(entity["image"].to(self.device))), dim=0)
-                img = self.run_epoch_aan(input, grey_to_rgb(source["image"].to(self.device)), target)
+                        target = torch.cat((target, entity["image"].to(self.device)), dim=0)
+                img = self.run_epoch_aan(input, grey_to_rgb(source["image"].to(self.device)), target, idx)
                 save_image(img, out_path)
                 print("Image {}, in total {} samples".format(idx, self.num_sample))
                 torch.cuda.empty_cache()
+
+    def run_epoch_aan(self, input, source, target, idx):
+        model = AAN()
+        # solver = Solver(model, train_loader, val_loader, **configs[i])
+        # solver.train(epochs=EPOCHS, patience=PATIENCE)
+        I = 1200
+        input_i = input
+        lr_init = 1267.887980242703
+        for step in range(I):
+            before_op_time = time.time()
+            if input.grad is not None:
+                input.grad.zero_()
+            loss, loss_seman, loss_style, loss_grey = model(input_i, source, target)
+            loss.backward()
+            w = lr_init * (I - step) / I
+            input_i = input_i.detach() - w * input_i.grad / torch.linalg.norm(input_i.grad.view(-1), ord=1)
+            input_i.requires_grad_(True)
+            duration = time.time() - before_op_time
+            print("[Sample %d/%d]" % (idx + 1, self.num_sample), "[Step]", step, "[Loss]", loss, "[Duration]", duration)
+        img = input_i.squeeze(0)
+        return img
 
     def train_ran(self):
         input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
@@ -529,41 +555,6 @@ class Trainer:
                 self.log("train", inputs, outputs, losses)
                 self.val()
             self.step += 1
-
-    def run_epoch_aan(self, input, source, target):
-        I = 500
-        L_ANN = AAN()
-        for self.step in range(I):
-            before_op_time = time.time()
-            print("run epoch aan")
-
-            if input.grad is not None:
-                print("zero gradient")
-                input.grad.zero_()
-
-            # print("input", input)
-            loss = L_ANN(input, source, target)
-            loss.backward()
-
-            # loss = torch.autograd.Variable(L_ANN.forward(), requires_grad=True)
-            # grad = torch.autograd.grad(loss, input, allow_unused=True)
-
-            w = 20000 * (I - self.step) / I
-            # loss = self.compute_AAN_loss(input, source, target)
-            # loss.backward()
-
-            input = input.detach() - w * input.grad / torch.linalg.norm(input.grad.view(-1), ord=1)
-            input.requires_grad_(True)
-
-            # self.model_optimizer.zero_grad()
-            # self.model_optimizer.step()
-
-            duration = time.time() - before_op_time
-            print("step", self.step, "loss", loss, "duration", duration)
-
-            self.step += 1
-        img = input.squeeze(0)
-        return img
 
     def save_weight(self, model_save):
         if model_save == 'unet_encoder':
@@ -930,6 +921,19 @@ class Trainer:
                 transform=self.transform)
             custom_data_dir = self.opt.vendor_dir
 
+        if data_name == "cirrus_val":
+            """ cirrus
+            """
+            print("Loading cirrus test...")
+            dataset = datasets.Retouch_dataset
+            custom_dataset = dataset(
+                base_dir=self.opt.base_dir,
+                list_dir=os.path.join("splits", "split_cirrus"),
+                split='val',
+                is_train=True,
+                transform=self.transform)
+            custom_data_dir = self.opt.vendor_dir
+
         elif data_name == "spectralis":
             """ spectralis
             """
@@ -966,7 +970,7 @@ class Trainer:
             custom_data_dir = self.opt.cataract_dir
 
         else:
-            print("Invalid model name, exiting...")
+            print("Invalid data set name, exiting...")
             exit()
 
         return custom_dataset, custom_data_dir
