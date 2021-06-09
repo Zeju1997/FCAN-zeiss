@@ -37,6 +37,8 @@ from networks.aan_net import AAN
 
 from hyperparameter_tuning import random_search
 
+import shutil
+
 
 def pil_loader(path):
     # open path as file to avoid ResourceWarning
@@ -69,9 +71,11 @@ num_epochs = 15
 #   when True we only update the reshaped layer params
 feature_extract = True
 
+
 def grey_to_rgb(img):
     img = torch.cat((img, img, img), 1)
     return img
+
 
 def rescale_transform(img, out_range=(0, 1)):
     img = img - img.min()
@@ -86,6 +90,7 @@ def get_activation(name):
         # activation[name] = output.detach()
         activation[name] = output
     return hook
+
 
 CIRRUS = "/home/zeju/Documents/zeiss_domain_adaption/splits/cirrus_samples.txt"
 SPECTRALIS = "/home/zeju/Documents/zeiss_domain_adaption/splits/cirrus_samples.txt"
@@ -145,8 +150,8 @@ class Trainer:
         self.optimizer_F = optim.Adam(self.parameters_to_train_F, self.opt.learning_rate)
         self.optimizer_D = optim.Adam(self.parameters_to_train_D, self.opt.learning_rate)
 
-        self.models["unet_down4"] = UNet_Layer(output_layer='down4')
-        self.models["unet_down4"].to(self.device)
+        # self.models["unet_down4"] = UNet_Layer(output_layer='down4')
+        # self.models["unet_down4"].to(self.device)
         # self.parameters_to_train += list(self.models["unet"].parameters())
         # self.parameters_to_train += list(self.models["resnet50"].parameters())
         # self.parameters_to_train += list(self.models["resnet101"].parameters())
@@ -167,7 +172,16 @@ class Trainer:
         '''
 
         self.dataset = datasets.Retouch_dataset
+        self.coco_dataset = datasets.Coco_dataset
 
+        self.transform = None
+        '''
+        self.transform = transforms.Compose([
+            transforms.Normalize(mean=[0.1422], std=[0.0885])
+        ])
+        '''
+
+        '''
         if self.opt.use_augmentation:
             self.transform = transforms.Compose([transforms.RandomHorizontalFlip(p=0.5),
                                                  transforms.RandomVerticalFlip(p=0.5),
@@ -175,50 +189,25 @@ class Trainer:
                                                  ])
         else:
             self.transform = None
+        '''
 
         # self.criterion = nn.CrossEntropyLoss(weight=torch.FloatTensor(self.opt.ce_weighting).to(self.device),
         #                                      ignore_index=self.opt.ignore_idx)
         self.criterion = nn.CrossEntropyLoss(reduction='none')
 
-        self.cirrus_dataset = self.dataset(
-            base_dir=self.opt.base_dir,
-            list_dir=self.opt.vendor_dir,
-            split='cirrus_samples',
-            is_train=True,
-            transform=self.transform)
+        self.source_dataset_AAN, self.source_dir_AAN = self.initialize_dataset_AAN("cirrus")
+        self.target_dataset_AAN, self.target_dir_AAN = self.initialize_dataset_AAN("spectralis")
 
-        self.cirrus_loader = DataLoader(
-            self.cirrus_dataset,
+        self.source_dataloader_AAN = DataLoader(
+            self.source_dataset_AAN,
             1,
             True,
             num_workers=self.opt.num_workers,
             pin_memory=True,
             drop_last=True)
 
-        self.spectralis_dataset = self.dataset(
-            base_dir=self.opt.base_dir,
-            list_dir=self.opt.vendor_dir,
-            split='spectralis_samples',
-            is_train=True,
-            transform=self.transform)
-
-        self.spectralis_loader = DataLoader(
-            self.spectralis_dataset,
-            1,
-            True,
-            num_workers=self.opt.num_workers,
-            pin_memory=True,
-            drop_last=True)
-
-        self.spectralis_aan_dataset_ = self.dataset(
-            base_dir=self.opt.aan_dir,
-            list_dir=self.opt.vendor_dir,
-            split='spectralis_samples',
-            is_train=True,
-            transform=self.transform)
-
-        self.spectralis_ann_loader = DataLoader(
-            self.spectralis_dataset,
+        self.target_dataloader_AAN = DataLoader(
+            self.target_dataset_AAN,
             1,
             True,
             num_workers=self.opt.num_workers,
@@ -259,10 +248,9 @@ class Trainer:
 
         num_train_samples = len(train_dataset)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
-        self.num_total_steps_AAN = len(self.cirrus_dataset) + len(self.spectralis_dataset)
 
         self.writers = {}
-        for mode in ["train", "val", "AAN"]:
+        for mode in ["train", "val", "AAN", "RAN"]:
             self.writers[mode] = SummaryWriter(os.path.join(self.log_path, mode))
 
 
@@ -291,46 +279,88 @@ class Trainer:
                 self.save_model()
     '''
 
-    def train_aan(self, alpha=1e-14, w_sem=[1, 1, 1, 1, 1], w_sty=[1, 1, 1, 1, 1]):
-        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
+    def normalize(self):
+        data_mean = torch.zeros(1)
+        data_std = torch.zeros(1)
+        data_len = len(self.source_dataloader_AAN)
+
+        for idx, source in enumerate(self.source_dataloader_AAN):
+            data_mean = data_mean + torch.mean(source["image"]) / data_len
+            data_std = data_std + torch.std(source["image"]) / data_len
+        print("[Data mean]: {}, [Data std]: {}".format(data_mean, data_std)) # [Data mean]: tensor([0.1422]), [Data std]: tensor([0.0885])
+
+    def train_coco(self):
+        target_dataloader_iterator = iter(self.source_dataloader_AAN)
+        sample = next(target_dataloader_iterator)
+
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=sample["image"].shape, device=self.device))
+        input.requires_grad_(True)
+
+        self.epoch = 0
+        self.step = 0
+        self.data = 0
+        self.start_time = time.time()
+        self.num_batch = 2
+        self.num_sample = len(self.source_dataloader_AAN)
+        print("In total {} samples found.".format(self.num_sample))
+        for idx, source in enumerate(self.source_dataloader_AAN):
+            out_dir = os.path.join(self.source_dir_AAN, "aan_processed")
+            out_path = os.path.join(out_dir, source["sample_name"][0])
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+            if os.path.isdir(out_dir):
+                for i in range(self.num_batch):
+                    entity = next(target_dataloader_iterator)
+                    if i == 0:
+                        target = entity["image"].to(self.device)
+                    else:
+                        target = torch.cat((target, entity["image"].to(self.device)), dim=0)
+                img = self.run_epoch_aan(input, source["image"].to(self.device), target)
+                save_image(img, out_path)
+                print("Image {}, in total {} samples".format(idx, self.num_sample))
+                torch.cuda.empty_cache()
+
+    def printbn(self, input, output, test):
+        print('Inside ' + self.__class__.__name__ + ' forward')
+        print("running mean", input.running_mean.shape)
+        print("running mean", input.running_mean.shape)
+        mean = input[0].mean(dim=0)
+        var = input[0].var(dim=0)
+        print(mean)
+
+    def train_aan(self):
+        target_dataloader_iterator = iter(self.target_dataloader_AAN)
+        sample = next(target_dataloader_iterator)
+
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=sample["image"].shape, device=self.device))
         input.requires_grad_(True)
 
         '''
-        source_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(CIRRUS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
-        target_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(SPECTRALIS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
-        save_image(source_img, 'source_img.png')
-        save_image(target_img, 'target_img.png')
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(3, 512, 512)))
+        input = input.unsqueeze(0)
+        net = torchvision.models.resnet50(pretrained=False)
+        net.layer1[1].bn1.register_forward_hook(self.printbn)
+        net.forward(input)
         '''
 
-        '''
-        inputs = {}
-        inputs["source"] = source_img
-        inputs["target"] = target_img
-        L_RAN = self.compute_RAN_loss(inputs)
-        '''
-        self.alpha = alpha
-        self.w_sem = w_sem
-        self.w_sty = w_sty
         self.epoch = 0
         self.step = 0
         self.data = 0
         self.start_time = time.time()
         self.num_batch = 5
-        self.num_sample = len(self.spectralis_loader)
-        dataloader_iterator = iter(self.cirrus_loader)
+        self.num_sample = len(self.source_dataloader_AAN)
         print("In total {} samples found.".format(self.num_sample))
-        for idx, source in enumerate(self.spectralis_loader):
+        for idx, source in enumerate(self.source_dataloader_AAN):
             vendor = source["case_name"][0].split(' ')[0]
             slice_name = source["case_name"][0].split(' ')[1]
             slice_idx = source["case_name"][0].split(' ')[2].zfill(3)
-            out_dir = os.path.join(self.opt.vendor_dir, "aan_processed", "{}".format(vendor), "{}".format(slice_name), "image")
+            out_dir = os.path.join(self.source_dir_AAN, "aan_processed", "{}".format(vendor), "{}".format(slice_name), "image")
             out_path = os.path.join(out_dir, "{}.jpg".format(slice_idx))
             if not os.path.exists(out_dir):
                 os.makedirs(out_dir)
-            if os.path.exists(out_path):
-                # target = grey_to_rgb()
+            if os.path.exists(out_dir):
                 for i in range(self.num_batch):
-                    entity = next(dataloader_iterator)
+                    entity = next(target_dataloader_iterator)
                     if i == 0:
                         target = grey_to_rgb(entity["image"].to(self.device))
                     else:
@@ -343,7 +373,6 @@ class Trainer:
     def train_ran(self):
         input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
         input.requires_grad_(True)
-
         '''
         source_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(CIRRUS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
         target_img = Variable(grey_to_rgb(transforms.ToTensor()(pil_loader(SPECTRALIS_SAMPLE))).unsqueeze(0).cuda(), requires_grad=False)
@@ -357,42 +386,26 @@ class Trainer:
         inputs["target"] = target_img
         L_RAN = self.compute_RAN_loss(inputs)
         '''
-        self.sample = 0
+        self.step_adv = 0
+        self.step_seg = 0
         self.num_sample = 0
         self.num_epoch = 10
         self.num_iteration = 10
-        self.loss = nn.BCELoss()
+        self.alternate_branch = 200
+        self.adversarial_loss = nn.BCELoss()
+        iter = int(len(self.source_dataloader_AAN) / self.alternate_branch)
         for self.epoch in range(self.num_epoch):
+            for idx in range(iter):
+                # run adversarial branch
+                self.run_epoch_adv()
+                self.save_weight('unet_encoder')
 
-            # run adversarial branch
-            self.run_epoch_adv()
+                # run segmentation branch
+                self.run_epoch_seg()
+                self.save_weight('unet')
 
-            self.save_weight('unet_encoder')
-
-            # run segmentation branch
-            self.run_epoch_seg()
-
-            self.save_weight('unet')
-
-            sys.exit()
-
-            if (self.epoch + 1) % self.opt.save_frequency == 0 and self.opt.save_model:
-                self.save_model()
-
-            '''
-            
-            print(
-                "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
-                % (epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
-            )
-            
-            
-            batches_done = epoch * len(dataloader) + i
-            if batches_done % opt.sample_interval == 0:
-                save_image(gen_imgs.data[:25], "images/%d.png" % batches_done, nrow=5, normalize=True)
-            '''
     def run_epoch_adv(self):
-        for cirrus_sample, spectralis_sample in zip(self.cirrus_loader, self.spectralis_loader):   # spectralis aan processed data!!!!!!!!!!!!!
+        for idx, (source_sample, target_sample) in enumerate(zip(self.source_dataloader_AAN, self.target_dataloader_AAN)):   # spectralis aan processed data!!!!!!!!!!!!!
             '''
                 F(x_t) = x: true data / spectralis / target
                 F(x_s) = G(z): generated data / cirrus / source
@@ -413,53 +426,65 @@ class Trainer:
             inputs["label"] = source["label"]
             L_RAN = self.compute_RAN_loss(inputs)
             '''
+
             # zero the gradients of the feature extractor on each iteration
             self.optimizer_F.zero_grad()
 
             # generate feature encoding
-            generated_data = self.models["unet_encoder"](cirrus_sample["image"].cuda()) # [1, 512, 32, 32]
-            true_data = self.models["unet_encoder"](spectralis_sample["image"].cuda()) # [1, 512, 32, 32]
+            generated_data = self.models["unet_encoder"](source_sample["image"].cuda()) # [1, 512, 32, 32]
+            true_data = self.models["unet_encoder"](target_sample["image"].cuda()) # [1, 512, 32, 32]
 
             true_labels = torch.ones_like(true_data) # [1, 512, 32, 32]
-            false_labels = torch.zeros_like(true_data) # [1, 512, 32, 32]
+            fake_labels = torch.zeros_like(true_data) # [1, 512, 32, 32]
 
-            # Train the generator
+            # -----------------
+            #  Train Generator
+            # -----------------
+
             # We invert the labels here and don't train the discriminator because we want the generator
             # to make things the discriminator classifies as true
             generator_discriminator_out = self.models["RAN"](generated_data) # [1, 512, 32, 32]
-            generator_loss = self.loss(generator_discriminator_out, true_labels)
+            generator_loss = self.adversarial_loss(generator_discriminator_out, true_labels)
             generator_loss.backward()
             self.optimizer_F.step()
 
             # Z = prediction_cirrus[1] * prediction_cirrus[2] * prediction_cirrus[3]
 
+            # ---------------------
+            #  Train Discriminator
+            # ---------------------
+
             # Train the discriminator on the true/generated data
             self.optimizer_D.zero_grad()
             true_discriminator_loss = self.models["RAN"](true_data)
-            true_discriminator_loss = self.loss(true_discriminator_loss, true_labels)
+            true_discriminator_loss = self.adversarial_loss(true_discriminator_loss, true_labels)
 
             # add .detach() here think about this
-            generator_discriminator_out = self.models["RAN"](generated_data.detach())
-            generator_discriminator_loss = self.loss(generator_discriminator_out, false_labels)
-            discriminator_loss = (true_discriminator_loss + generator_discriminator_loss) / 2
+            fake_discriminator_out = self.models["RAN"](generated_data.detach())
+            fake_discriminator_loss = self.adversarial_loss(fake_discriminator_out, fake_labels)
+            discriminator_loss = (true_discriminator_loss + fake_discriminator_loss) / 2
 
             discriminator_loss.backward()
             self.optimizer_D.step()
 
-            self.sample += 1
+            self.step_adv += 1
 
             print(
                 "[Epoch %d/%d] [Sample %d/%d] [D loss: %f] [G loss: %f]"
-                % (self.epoch, self.num_epoch, self.sample, len(self.cirrus_loader), discriminator_loss.item(), generator_loss.item())
+                % (self.epoch, self.num_epoch, self.step_adv, len(self.source_dataloader_AAN), discriminator_loss.item(), generator_loss.item())
             )
+
+            if self.step_adv % self.opt.log_frequency == 0:
+                self.log_gan("RAN", generator_loss.item(), discriminator_loss.item(), self.step_adv)
+
+            if self.step_adv % self.alternate_branch == 0:
+                break
 
     def run_epoch_seg(self):
         """Run a single epoch of training and validation
         """
         print("Training")
-        self.set_train()
-        for batch_idx, inputs in enumerate(self.train_loader):
-            print("input", inputs)
+        for idx, inputs in enumerate(self.source_dataloader_AAN):
             before_op_time = time.time()
             outputs, losses = self.process_batch(inputs)
             self.model_optimizer.zero_grad()
@@ -470,17 +495,19 @@ class Trainer:
             # log less frequently after the first 2000 steps to save time & disk space
             # early_phase = batch_idx % self.opt.log_frequency == 0 #and self.step < 2000
             # late_phase = self.step % 2000 == 0
-            '''
-            if batch_idx % self.opt.log_frequency == 0:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
-                self.log("train", inputs, outputs, losses)
-                self.val()
-            '''
+
+            self.step_seg += 1
 
             print(
-                "[Epoch %d/%d] [Sample %d/%d] [D loss: %f]"
-                % (self.epoch, self.num_epoch, batch_idx, len(self.train_loader), losses["loss"].item())
+                "[Epoch %d/%d] [Sample %d/%d] [Seg loss: %f]"
+                % (self.epoch, self.num_epoch, self.step_seg, len(self.source_dataloader_AAN), losses["loss"].item())
             )
+
+            if self.step_seg % self.opt.log_frequency == 0:
+                self.log_seg("RAN", losses["loss"].item(), self.step_seg)
+
+            if self.step_seg % self.alternate_branch == 0:
+                break
 
     def run_epoch(self):
         """Run a single epoch of training and validation
@@ -508,6 +535,7 @@ class Trainer:
         L_ANN = AAN()
         for self.step in range(I):
             before_op_time = time.time()
+            print("run epoch aan")
 
             if input.grad is not None:
                 print("zero gradient")
@@ -739,6 +767,21 @@ class Trainer:
             writer.add_image("predictions/{}".format(j), normalize_image(outputs["pred_idx"][j].data), self.step)
             writer.add_image("positive_region/{}".format(j), outputs["mask"][j].data, self.step)
 
+    def log_gan(self, mode, gen_loss, dis_loss, step):
+        writer = self.writers[mode]
+        writer.add_scalars(f'loss/adv_branch', {
+            'generator_loss': gen_loss,
+            'discriminator_loss': dis_loss,
+        }, step)
+
+    def log_seg(self, mode, loss, step):
+        writer = self.writers[mode]
+        writer.add_scalars(f'loss/seg_branch', {
+            'segmentation_loss': loss,
+        }, step)
+
+
+
     def save_model(self):
         """Save model weights to disk
         """
@@ -868,7 +911,65 @@ class Trainer:
 
         return model_ft
 
+    def initialize_dataset_AAN(self, data_name):
+        # Initialize these variables which will be set in this if statement. Each of these
+        #   variables is model specific.
+        custom_dataset = None
+        custom_data_dir = None
 
+        if data_name == "cirrus":
+            """ cirrus
+            """
+            print("Loading cirrus...")
+            dataset = datasets.Retouch_dataset
+            custom_dataset = dataset(
+                base_dir=self.opt.base_dir,
+                list_dir=self.opt.vendor_dir,
+                split='cirrus_samples',
+                is_train=True,
+                transform=self.transform)
+            custom_data_dir = self.opt.vendor_dir
+
+        elif data_name == "spectralis":
+            """ spectralis
+            """
+            print("Loading spectralis...")
+            dataset = datasets.Retouch_dataset
+            custom_dataset = dataset(
+                base_dir=self.opt.base_dir,
+                list_dir=self.opt.vendor_dir,
+                split='spectralis_samples',
+                is_train=True,
+                transform=self.transform)
+            custom_data_dir = self.opt.vendor_dir
+
+        elif data_name == "cadis":
+            """ cadis
+            """
+            print("Loading cadis...")
+            dataset = datasets.Coco_dataset
+            custom_dataset = dataset(
+                root=self.opt.cadis_dir,
+                split='training',
+                transform=self.transform)
+            custom_data_dir = self.opt.cadis_dir
+
+        elif data_name == "cataract":
+            """ cataract
+            """
+            print("Loading cataract...")
+            dataset = datasets.Coco_dataset
+            custom_dataset = dataset(
+                root=self.opt.cataract_dir,
+                split='training',
+                transform=self.transform)
+            custom_data_dir = self.opt.cataract_dir
+
+        else:
+            print("Invalid model name, exiting...")
+            exit()
+
+        return custom_dataset, custom_data_dir
 
     def evaluate(self):
         self.dice_loss = 0
@@ -885,10 +986,10 @@ class Trainer:
 
 
     def hyperparameter_tuning(self):
-        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 1, 512, 512), device=self.device))
+        input = rescale_transform(torch.normal(mean=0.5, std=1, size=(1, 3, 512, 512), device=self.device))
         input.requires_grad_(True)
 
-        results = random_search(input, self.cirrus_loader, self.spectralis_loader,
+        results = random_search(self.source_dataloader_AAN, self.target_dataloader_AAN,
                                                           random_search_spaces = {
                                                             # "lr": ([1e-3, 1e-4], 'log'),
                                                             # "lr_decay": ([0.8, 0.9], 'float'),
@@ -896,21 +997,21 @@ class Trainer:
                                                             # "std": ([1e-2, 1e-5], "log"), # [1e-4, 1e-6]
                                                             # "hidden_size": ([150, 250], "int"),
                                                             # "num_layer": ([2, 4], "int"), # [2, 5]
-                                                            "w_os_conv1": ([8, 10], 'float'),
-                                                            "w_os_res2c": ([6, 8], 'float'),
-                                                            "w_os_res3d": ([4, 6], 'float'),
-                                                            "w_os_res4f": ([2, 4], 'float'),
-                                                            "w_os_res5c": ([1, 3], 'float'),
-                                                            "w_ot_conv1": ([8, 10], 'float'),
-                                                            "w_ot_res2c": ([6, 8], 'float'),
-                                                            "w_ot_res3d": ([4, 6], 'float'),
-                                                            "w_ot_res4f": ([2, 4], 'float'),
-                                                            "w_ot_res5c": ([1, 3], 'float'),
-                                                            "alpha": ([5e-3, 5e-3], 'log'),
+                                                            "w_os_conv1": ([0.98, 1.02], 'float'),
+                                                            "w_os_res2c": ([2, 4], 'float'),
+                                                            "w_os_res3d": ([4, 8], 'float'),
+                                                            "w_os_res4f": ([8, 16], 'float'),
+                                                            "w_os_res5c": ([16, 32], 'float'),
+                                                            "w_ot_conv1": ([0.98, 1.02], 'float'),
+                                                            "w_ot_res2c": ([2, 4], 'float'),
+                                                            "w_ot_res3d": ([4, 8], 'float'),
+                                                            "w_ot_res4f": ([8, 16], 'float'),
+                                                            "w_ot_res5c": ([16, 32], 'float'),
+                                                            "alpha": ([1200000, 1500000], 'float'), # [1200000, 1500000]
                                                            },
                                                             hyper_param = {
-                                                            "lr_init": ([5000, 15000], 'float')
-                                                           }, num_search=20, num_samples=4, epochs=1, patience=20, writer=self.writers["AAN"])
+                                                            "lr_init": ([1100, 1300], 'float') # [1100, 1300]
+                                                           }, num_search=10, num_samples=4, epochs=1, patience=400, writer=self.writers["AAN"])
         # print("results", results)
 
 
